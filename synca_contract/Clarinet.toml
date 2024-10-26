@@ -1,0 +1,24 @@
+[project]
+name = 'synca_contract'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.data_storage]
+path = 'contracts/data_storage.clar'
+clarity_version = 2
+epoch = 2.5
+
+[contracts.user_identity]
+path = 'contracts/user_identity.clar'
+clarity_version = 2
+epoch = 2.5
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
