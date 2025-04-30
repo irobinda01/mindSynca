@@ -25,6 +25,11 @@ path = 'contracts/data_validation.clar'
 clarity_version = 2
 epoch = 2.5
 
+[contracts.impact_report]
+path = 'contracts/impact_report.clar'
+clarity_version = 2
+epoch = 2.5
+
 [contracts.research_funding]
 path = 'contracts/research_funding.clar'
 clarity_version = 2
