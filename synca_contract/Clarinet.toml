@@ -10,6 +10,11 @@ path = 'contracts/anonymization.clar'
 clarity_version = 2
 epoch = 2.5
 
+[contracts.basic_voting]
+path = 'contracts/basic_voting.clar'
+clarity_version = 2
+epoch = 2.5
+
 [contracts.data_shearing_and_consent_management]
 path = 'contracts/data_shearing_and_consent_management.clar'
 clarity_version = 2
