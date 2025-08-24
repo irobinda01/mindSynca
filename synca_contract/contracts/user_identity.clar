@@ -1,254 +1,264 @@
-
-;; title: user_identity
-;; version:
-;; summary:
-;; description:
-
-;; traits
-;;
-
-;; token definitions
-;;
-
-;; constants
-;;
-
-;; data vars
-;;
-
-;; data maps
-;;
-
-;; public functions
-;;
-
-;; read only functions
-;;
-
-;; private functions
-;;
-
-;; User Authentication and Identity Management Contract
+;; Meta-Transaction Wallet Contract
+;; Allows third-party relayers to submit transactions on behalf of users
 
 ;; Constants
-(define-constant contract-owner tx-sender)
-(define-constant err-owner-only (err u100))
-(define-constant err-unauthorized (err u101))
-(define-constant err-already-registered (err u102))
-(define-constant err-not-found (err u103))
-(define-constant err-invalid-role (err u104))
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_NOT_AUTHORIZED (err u100))
+(define-constant ERR_INVALID_SIGNATURE (err u101))
+(define-constant ERR_NONCE_USED (err u102))
+(define-constant ERR_EXPIRED (err u103))
+(define-constant ERR_INSUFFICIENT_BALANCE (err u104))
 
-;; Define roles as uint values
-(define-constant ROLE-PATIENT u1)
-(define-constant ROLE-DOCTOR u2)
-(define-constant ROLE-RESEARCHER u3)
-(define-constant ROLE-ADMIN u4)
+;; Data Variables
+(define-data-var contract-nonce uint u0)
 
-;; Data structures
-(define-map user-identities
-    principal
-    {
-        did: (string-utf8 64),              ;; Decentralized Identity
-        role: uint,                         ;; User role
-        verification-status: bool,          ;; Whether the identity is verified
-        metadata: (string-utf8 256),        ;; Additional identity metadata
-        registration-time: uint,            ;; When the identity was registered
-        last-updated: uint                  ;; Last update timestamp
-    }
+;; Data Maps
+;; Track nonces for each user to prevent replay attacks
+(define-map user-nonces principal uint)
+
+;; Track wallet balances
+(define-map wallet-balances principal uint)
+
+;; Store authorized relayers
+(define-map authorized-relayers principal bool)
+
+;; Helper Functions
+
+;; Get user's current nonce
+(define-read-only (get-user-nonce (user principal))
+  (default-to u0 (map-get? user-nonces user))
 )
 
-(define-map role-permissions
-    uint
-    {
-        can-verify-others: bool,
-        can-update-permissions: bool,
-        can-access-anonymized-data: bool
-    }
+;; Get wallet balance
+(define-read-only (get-wallet-balance (user principal))
+  (default-to u0 (map-get? wallet-balances user))
 )
 
-(define-map verification-requests
-    principal
-    {
-        proof-document: (string-utf8 64),
-        requested-role: uint,
-        status: (string-utf8 20),
-        verifier: (optional principal)
-    }
+;; Check if relayer is authorized
+(define-read-only (is-authorized-relayer (relayer principal))
+  (default-to false (map-get? authorized-relayers relayer))
 )
 
-;; Initialize role permissions
-(map-set role-permissions ROLE-PATIENT
-    {
-        can-access-anonymized-data: false,
-        can-verify-others: false,
-        can-update-permissions: false
-    }
+;; Increment user nonce
+(define-private (increment-user-nonce (user principal))
+  (let ((current-nonce (get-user-nonce user)))
+    (map-set user-nonces user (+ current-nonce u1))
+    (+ current-nonce u1)
+  )
 )
 
-(map-set role-permissions ROLE-DOCTOR
-    {
-        can-access-anonymized-data: true,
-        can-verify-others: false,
-        can-update-permissions: false
-    }
+;; Create message hash for signature verification
+(define-read-only (create-message-hash 
+  (from principal)
+  (to principal) 
+  (amount uint)
+  (nonce uint)
+  (expiry uint))
+  (sha256 (concat
+    (concat
+      (concat (unwrap-panic (to-consensus-buff? from)) (unwrap-panic (to-consensus-buff? to)))
+      (concat (unwrap-panic (to-consensus-buff? amount)) (unwrap-panic (to-consensus-buff? nonce)))
+    )
+    (unwrap-panic (to-consensus-buff? expiry))
+  ))
 )
 
-(map-set role-permissions ROLE-RESEARCHER
-    {
-        can-access-anonymized-data: true,
-        can-verify-others: false,
-        can-update-permissions: false
-    }
+;; Admin Functions
+
+;; Add authorized relayer
+(define-public (add-relayer (relayer principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set authorized-relayers relayer true)
+    (ok true)
+  )
 )
 
-(map-set role-permissions ROLE-ADMIN
-    {
-        can-access-anonymized-data: true,
-        can-verify-others: true,
-        can-update-permissions: true
-    }
+;; Remove authorized relayer
+(define-public (remove-relayer (relayer principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-delete authorized-relayers relayer)
+    (ok true)
+  )
 )
 
-;; Private functions
-(define-private (is-admin (user principal))
-    (let ((identity (unwrap! (map-get? user-identities user) false)))
-        (and
-            (is-eq (get role identity) ROLE-ADMIN)
-            (get verification-status identity)
+;; Wallet Functions
+
+;; Deposit STX to wallet
+(define-public (deposit (amount uint))
+  (let ((current-balance (get-wallet-balance tx-sender)))
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set wallet-balances tx-sender (+ current-balance amount))
+    (ok amount)
+  )
+)
+
+;; Withdraw STX from wallet
+(define-public (withdraw (amount uint))
+  (let ((current-balance (get-wallet-balance tx-sender)))
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (map-set wallet-balances tx-sender (- current-balance amount))
+    (ok amount)
+  )
+)
+
+;; Meta-Transaction Functions
+
+;; Execute meta-transaction (called by relayer)
+(define-public (execute-meta-transaction
+  (from principal)
+  (to principal)
+  (amount uint)
+  (nonce uint)
+  (expiry uint)
+  (signature (buff 65)))
+  (let (
+    (current-nonce (get-user-nonce from))
+    (current-balance (get-wallet-balance from))
+    (message-hash (create-message-hash from to amount nonce expiry))
+  )
+    ;; Verify relayer is authorized
+    (asserts! (is-authorized-relayer tx-sender) ERR_NOT_AUTHORIZED)
+    
+    ;; Verify nonce hasn't been used
+    (asserts! (is-eq nonce current-nonce) ERR_NONCE_USED)
+    
+    ;; Verify transaction hasn't expired
+    (asserts! (> expiry block-height) ERR_EXPIRED)
+    
+    ;; Verify signature
+    (let ((recovered-pubkey (unwrap! (secp256k1-recover? message-hash signature) ERR_INVALID_SIGNATURE)))
+      (asserts! (is-eq from (unwrap! (principal-of? recovered-pubkey) ERR_INVALID_SIGNATURE)) ERR_INVALID_SIGNATURE)
+    )
+    
+    ;; Verify sufficient balance
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Execute the transaction
+    (map-set wallet-balances from (- current-balance amount))
+    (map-set wallet-balances to (+ (get-wallet-balance to) amount))
+    
+    ;; Increment nonce to prevent replay
+    (increment-user-nonce from)
+    
+    (ok {
+      from: from,
+      to: to,
+      amount: amount,
+      nonce: nonce,
+      relayer: tx-sender
+    })
+  )
+)
+
+;; Batch meta-transactions
+(define-public (batch-meta-transactions
+  (transactions (list 10 {
+    from: principal,
+    to: principal,
+    amount: uint,
+    nonce: uint,
+    expiry: uint,
+    signature: (buff 65)
+  })))
+  (begin
+    (asserts! (is-authorized-relayer tx-sender) ERR_NOT_AUTHORIZED)
+    (ok (map execute-single-meta-tx transactions))
+  )
+)
+
+;; Helper for batch processing
+(define-private (execute-single-meta-tx (tx {
+  from: principal,
+  to: principal,
+  amount: uint,
+  nonce: uint,
+  expiry: uint,
+  signature: (buff 65)
+}))
+  (execute-meta-transaction
+    (get from tx)
+    (get to tx)
+    (get amount tx)
+    (get nonce tx)
+    (get expiry tx)
+    (get signature tx)
+  )
+)
+
+;; Utility Functions
+
+;; Get domain separator for EIP-712 style signatures
+(define-read-only (get-domain-separator)
+  (sha256 (concat
+    (unwrap-panic (to-consensus-buff? "MetaTransactionWallet"))
+    (unwrap-panic (to-consensus-buff? contract-caller))
+  ))
+)
+
+;; Emergency Functions
+
+;; Emergency pause (only owner)
+(define-data-var contract-paused bool false)
+
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+;; View Functions
+
+;; Get user's meta-transaction data
+(define-read-only (get-user-meta-data (user principal))
+  {
+    nonce: (get-user-nonce user),
+    balance: (get-wallet-balance user)
+  }
+)
+
+;; Verify meta-transaction without executing
+(define-read-only (verify-meta-transaction
+  (from principal)
+  (to principal)
+  (amount uint)
+  (nonce uint)
+  (expiry uint)
+  (signature (buff 65)))
+  (let (
+    (current-nonce (get-user-nonce from))
+    (current-balance (get-wallet-balance from))
+    (message-hash (create-message-hash from to amount nonce expiry))
+    (recovered-pubkey-result (secp256k1-recover? message-hash signature))
+  )
+    {
+      valid-nonce: (is-eq nonce current-nonce),
+      not-expired: (> expiry block-height),
+      valid-signature: (is-ok recovered-pubkey-result),
+      signature-match: (match recovered-pubkey-result
+        ok-pubkey (match (principal-of? ok-pubkey)
+          ok-principal (is-eq from ok-principal)
+          err-val false
         )
-    )
-)
-
-(define-private (can-verify (user principal))
-    (let ((identity (unwrap! (map-get? user-identities user) false)))
-        (let ((permissions (unwrap! (map-get? role-permissions (get role identity)) false)))
-            (and
-                (get verification-status identity)
-                (get can-verify-others permissions)
-            )
-        )
-    )
-)
-
-;; Public functions
-
-;; Register new identity
-(define-public (register-identity (did (string-utf8 64)) (role uint) (metadata (string-utf8 256)))
-    (let ((existing-identity (map-get? user-identities tx-sender)))
-        (asserts! (is-none existing-identity) (err err-already-registered))
-        (asserts! (or (is-eq role ROLE-PATIENT)
-                     (is-eq role ROLE-DOCTOR)
-                     (is-eq role ROLE-RESEARCHER))
-                 (err err-invalid-role))
-        
-        (ok (map-set user-identities
-            tx-sender
-            {
-                did: did,
-                role: role,
-                verification-status: (is-eq role ROLE-PATIENT),  ;; Auto-verify patients
-                metadata: metadata,
-                registration-time: block-height,
-                last-updated: block-height
-            }
-        ))
-    )
-)
-
-;; Submit verification request
-(define-public (submit-verification-request (proof-document (string-utf8 64)))
-    (let ((identity (unwrap! (map-get? user-identities tx-sender)
-                            (err err-not-found))))
-        (ok (map-set verification-requests
-            tx-sender
-            {
-                proof-document: proof-document,
-                requested-role: (get role identity),
-                status: u"pending",
-                verifier: none  ;; Simply use none for optional values
-            }
-        ))
-    )
-)
-
-;; Verify identity (admin only)
-(define-public (verify-identity (user principal))
-    (let ((request (unwrap! (map-get? verification-requests user)
-                           (err err-not-found))))
-        (asserts! (can-verify tx-sender) (err err-unauthorized))
-        
-        (map-set verification-requests user
-            (merge request {
-                status: u"approved",  ;; Changed to string-utf8
-                verifier: (some tx-sender)
-            })
-        )
-        
-        (let ((identity (unwrap! (map-get? user-identities user)
-                                (err err-not-found))))
-            (ok (map-set user-identities user
-                (merge identity {
-                    verification-status: true,
-                    last-updated: block-height
-                })
-            ))
-        )
-    )
-)
-
-;; Update identity metadata
-(define-public (update-metadata (new-metadata (string-utf8 256)))
-    (let ((identity (unwrap! (map-get? user-identities tx-sender)
-                            (err err-not-found))))
-        (ok (map-set user-identities
-            tx-sender
-            (merge identity {
-                metadata: new-metadata,
-                last-updated: block-height
-            })
-        ))
-    )
-)
-
-;; Check if user has specific permission
-(define-read-only (has-permission (user principal) (permission-key (string-utf8 64)))
-    (let ((identity (unwrap! (map-get? user-identities user) false)))
-        (let ((permissions (unwrap! (map-get? role-permissions (get role identity)) false)))
-            (and
-                (get verification-status identity)
-                (if (is-eq permission-key u"can-verify-others")
-                    (get can-verify-others permissions)
-                    (if (is-eq permission-key u"can-update-permissions")
-                        (get can-update-permissions permissions)
-                        (if (is-eq permission-key u"can-access-anonymized-data")
-                            (get can-access-anonymized-data permissions)
-                            false  ;; default case for unknown permissions
-                        )
-                    )
-                )
-            )
-        )
-    )
-)
-
-;; Get identity details
-(define-read-only (get-identity (user principal))
-    (map-get? user-identities user)
-)
-
-;; Get verification request status
-(define-read-only (get-verification-request (user principal))
-    (map-get? verification-requests user)
-)
-
-;; Check if user is verified
-(define-read-only (is-verified (user principal))
-    (let ((identity (unwrap! (map-get? user-identities user) false)))
-        (get verification-status identity)
-    )
-)
-
-;; Get role permissions
-(define-read-only (get-role-permissions (role uint))
-    (map-get? role-permissions role)
+        err-val false
+      ),
+      sufficient-balance: (>= current-balance amount)
+    }
+  )
 )
